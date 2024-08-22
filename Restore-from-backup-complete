@@ -1,0 +1,84 @@
+DECLARE @databaseName sysname;
+DECLARE @backupStartDate datetime;
+DECLARE @backup_set_id_start INT;
+DECLARE @backup_set_id_end INT;
+DECLARE @maxdiffbackup_set_id INT;
+
+-- Set the database to be used
+SET @databaseName = 'AdventureWorks2014';
+
+-- Get the latest full backup
+SELECT @backup_set_id_start = MAX(backup_set_id)
+FROM msdb.dbo.backupset
+WHERE database_name = @databaseName 
+  AND type = 'D'
+  AND is_copy_only = 0;
+
+-- Get the earliest full backup after the latest one
+SELECT @backup_set_id_end = MIN(backup_set_id)
+FROM msdb.dbo.backupset
+WHERE database_name = @databaseName 
+  AND type = 'D'
+  AND backup_set_id > @backup_set_id_start
+  AND is_copy_only = 0;
+
+IF @backup_set_id_end IS NULL 
+    SET @backup_set_id_end = 999999999;
+
+-- Get the latest differential backup
+SELECT @maxdiffbackup_set_id = MAX(backup_set_id)
+FROM msdb.dbo.backupset
+WHERE database_name = @databaseName 
+  AND type = 'I'
+  AND is_copy_only = 0
+  AND backup_set_id > @backup_set_id_start;
+
+-- Full backup restore command
+SELECT backup_set_id, 'full' AS backup_type, 'RESTORE DATABASE ' + @databaseName +
+    CASE WHEN mf.physical_device_name LIKE 'http%' THEN ' FROM URL = ''' ELSE ' FROM DISK = ''' END +
+    mf.physical_device_name + ''' WITH NORECOVERY'
+FROM msdb.dbo.backupset b
+JOIN msdb.dbo.backupmediafamily mf ON b.media_set_id = mf.media_set_id
+WHERE b.database_name = @databaseName
+  AND b.backup_set_id = @backup_set_id_start
+  AND is_copy_only = 0
+
+UNION
+
+-- Differential backup restore command
+SELECT backup_set_id, 'diff' AS backup_type, 'RESTORE DATABASE ' + @databaseName +
+    CASE WHEN mf.physical_device_name LIKE 'http%' THEN ' FROM URL = ''' ELSE ' FROM DISK = ''' END +
+    mf.physical_device_name + ''' WITH NORECOVERY'
+FROM msdb.dbo.backupset b
+JOIN msdb.dbo.backupmediafamily mf ON b.media_set_id = mf.media_set_id
+WHERE b.database_name = @databaseName
+  AND b.backup_set_id = @maxdiffbackup_set_id
+  AND b.type = 'I'
+  AND is_copy_only = 0
+
+UNION
+
+-- Log backup restore command
+SELECT backup_set_id, 'log' AS backup_type, 'RESTORE LOG ' + @databaseName +
+    CASE WHEN mf.physical_device_name LIKE 'http%' THEN ' FROM URL = ''' ELSE ' FROM DISK = ''' END +
+    mf.physical_device_name + ''' WITH NORECOVERY'
+FROM msdb.dbo.backupset b
+JOIN msdb.dbo.backupmediafamily mf ON b.media_set_id = mf.media_set_id
+WHERE b.database_name = @databaseName
+  AND b.backup_set_id >= @backup_set_id_start 
+  AND b.backup_set_id < @backup_set_id_end
+  AND b.backup_set_id > ISNULL(@maxdiffbackup_set_id, 0)
+  AND b.type = 'L'
+  AND is_copy_only = 0
+
+UNION
+
+-- Finish command to restore with recovery
+SELECT 999999999 AS backup_set_id, 'finish' AS backup_type, 'RESTORE DATABASE ' + @databaseName + ' WITH RECOVERY'
+ORDER BY backup_set_id;
+
+-- Select database file information
+SELECT d.name, mf.name, mf.physical_name 
+FROM sys.master_files mf WITH(NOLOCK)
+JOIN sys.databases d ON d.database_id = mf.database_id
+WHERE d.name LIKE @databaseName;
