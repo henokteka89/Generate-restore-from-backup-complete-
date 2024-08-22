@@ -1,0 +1,94 @@
+DECLARE @databaseName sysname
+DECLARE @backupStartDate datetime
+DECLARE @backup_set_id_start INT
+DECLARE @backup_set_id_end INT
+DECLARE @maxdiffbackup_set_id INT
+DECLARE @restoreCommand NVARCHAR(MAX)
+
+-- Set the database to be used
+SET @databaseName = 'stackoverflow2013'
+
+-- Get the latest full backup
+SELECT @backup_set_id_start = MAX(backup_set_id)
+FROM msdb.dbo.backupset
+WHERE database_name = @databaseName 
+  AND type = 'D'
+  AND is_copy_only = 0
+
+-- Get the earliest full backup after the latest one
+SELECT @backup_set_id_end = MIN(backup_set_id)
+FROM msdb.dbo.backupset
+WHERE database_name = @databaseName 
+  AND type = 'D'
+  AND backup_set_id > @backup_set_id_start
+  AND is_copy_only = 0
+
+IF @backup_set_id_end IS NULL 
+    SET @backup_set_id_end = 999999999
+
+-- Get the latest differential backup
+SELECT @maxdiffbackup_set_id = MAX(backup_set_id)
+FROM msdb.dbo.backupset
+WHERE database_name = @databaseName 
+  AND type = 'I'
+  AND is_copy_only = 0
+  AND backup_set_id > @backup_set_id_start
+
+-- Generate full backup restore command
+SELECT @restoreCommand = 'RESTORE DATABASE ' + @databaseName + 
+    CASE WHEN mf.physical_device_name LIKE 'http%' THEN ' FROM URL = ''' ELSE ' FROM DISK = ''' END + 
+    mf.physical_device_name + ''' WITH NORECOVERY;'
+FROM msdb.dbo.backupset b
+JOIN msdb.dbo.backupmediafamily mf ON b.media_set_id = mf.media_set_id
+WHERE b.database_name = @databaseName 
+AND b.backup_set_id = @backup_set_id_start 
+AND is_copy_only = 0
+
+PRINT @restoreCommand
+
+-- Generate differential backup restore command
+IF @maxdiffbackup_set_id IS NOT NULL
+BEGIN
+    SELECT @restoreCommand = 'RESTORE DATABASE ' + @databaseName + 
+        CASE WHEN mf.physical_device_name LIKE 'http%' THEN ' FROM URL = ''' ELSE ' FROM DISK = ''' END + 
+        mf.physical_device_name + ''' WITH NORECOVERY;'
+    FROM msdb.dbo.backupset b
+    JOIN msdb.dbo.backupmediafamily mf ON b.media_set_id = mf.media_set_id
+    WHERE b.database_name = @databaseName 
+    AND b.backup_set_id = @maxdiffbackup_set_id 
+    AND b.type = 'I'
+    AND is_copy_only = 0
+    
+    PRINT @restoreCommand
+END
+
+-- Generate log backups restore commands
+DECLARE @backup_set_id INT
+DECLARE log_cursor CURSOR FOR
+SELECT b.backup_set_id, 'RESTORE LOG ' + @databaseName + 
+    CASE WHEN mf.physical_device_name LIKE 'http%' THEN ' FROM URL = ''' ELSE ' FROM DISK = ''' END + 
+    mf.physical_device_name + ''' WITH NORECOVERY;'
+FROM msdb.dbo.backupset b
+JOIN msdb.dbo.backupmediafamily mf ON b.media_set_id = mf.media_set_id
+WHERE b.database_name = @databaseName 
+AND b.backup_set_id > @backup_set_id_start 
+AND b.backup_set_id < @backup_set_id_end
+AND b.type = 'L'
+AND is_copy_only = 0
+ORDER BY b.backup_set_id
+
+OPEN log_cursor
+FETCH NEXT FROM log_cursor INTO @backup_set_id, @restoreCommand
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    PRINT @restoreCommand
+    FETCH NEXT FROM log_cursor INTO @backup_set_id, @restoreCommand
+END
+
+CLOSE log_cursor
+DEALLOCATE log_cursor
+
+-- Generate the final restore with recovery command
+SET @restoreCommand = 'RESTORE DATABASE ' + @databaseName + ' WITH RECOVERY;'
+PRINT @restoreCommand
