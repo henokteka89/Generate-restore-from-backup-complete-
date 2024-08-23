@@ -5,6 +5,7 @@ DECLARE @backup_set_id_end INT
 DECLARE @maxdiffbackup_set_id INT
 DECLARE @restoreCommand NVARCHAR(MAX)
 
+Set Nocount ON
 -- Set the database to be used
 SET @databaseName = 'stackoverflow2013'
 
@@ -92,3 +93,5 @@ DEALLOCATE log_cursor
 -- Generate the final restore with recovery command
 SET @restoreCommand = 'RESTORE DATABASE ' + @databaseName + ' WITH RECOVERY;'
 PRINT @restoreCommand
+
+Set Nocount OFF
