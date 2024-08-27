@@ -1,0 +1,132 @@
+/* 
+   HENOK
+
+   Use Case Scenarios:
+   - This script is designed to automate the restoration of a SQL Server database from the most recent full backup.
+   - It supports both single backup files and striped backups (multiple backup files).
+   - It is suitable for scenarios where you need to restore a database regularly or after a certain period.
+   - The script is particularly useful in disaster recovery situations, testing environments, or for refreshing a database with the latest backup.
+   - In my use case, we needed to restore the database to its state from the week before a security and antivirus scan began on the server. 
+	 To achieve this, I used this script to perform a full backup and restore the database to the desired point in time.
+   
+   What the Command Does:
+   - Identifies the most recent full backup of the specified database.
+   - Collects all associated backup files if the backup is striped.
+   - Terminates all existing connections to the database to ensure that no users are connected during the restore process.
+   - Restores the database using the WITH REPLACE option, allowing the restoration even if the database already exists.
+   - Sends an email notification upon successful completion of the restore operation, providing confirmation and details.
+
+   What the Command Doesn't Do:
+   - This script does not handle differential or transaction log backups; it only restores from a full backup.
+   - It does not validate the integrity of the backup files before restoration.
+   - The script does not manage permissions or roles; it assumes that the executing user has the necessary permissions to kill connections, restore the database, and send emails.
+   - If the restore fails, the script does not send an email notification or retry the operation.
+
+   Additional Information:
+   - Ensure that the Database Mail profile is correctly configured and that the specified email address is correct.
+   - Modify the script as needed to fit specific scenarios, such as including additional backup types or handling multiple databases.
+   - Test the script in a non-production environment before deploying it in production to avoid unexpected issues.
+*/
+
+
+DECLARE @databaseName NVARCHAR(128) = 'ADMIN';
+DECLARE @backupPath NVARCHAR(500);
+DECLARE @restoreCommand NVARCHAR(MAX);
+DECLARE @killCommand NVARCHAR(MAX);
+DECLARE @spid INT;
+DECLARE @subject NVARCHAR(255);
+DECLARE @body NVARCHAR(MAX);
+
+SET NOCOUNT ON
+-- Collect all backup files associated with the latest full backup
+DECLARE @backupFiles TABLE (BackupFile NVARCHAR(500));
+
+INSERT INTO @backupFiles (BackupFile)
+SELECT bm.physical_device_name
+FROM msdb.dbo.backupset bs
+INNER JOIN msdb.dbo.backupmediafamily bm ON bs.media_set_id = bm.media_set_id
+WHERE bs.database_name = @databaseName
+AND bs.type = 'D' -- 'D' denotes full database backup
+AND bs.backup_finish_date = (SELECT MAX(backup_finish_date) 
+                             FROM msdb.dbo.backupset 
+                             WHERE database_name = @databaseName 
+                             AND type = 'D');
+
+IF NOT EXISTS (SELECT 1 FROM @backupFiles)
+BEGIN
+    RAISERROR('No full backup found for database %s', 16, 1, @databaseName);
+    RETURN;
+END
+
+-- Kill all connections to the database
+SET @killCommand = '';
+DECLARE spidCursor CURSOR FOR
+    SELECT spid
+    FROM sys.sysprocesses
+    WHERE dbid = DB_ID(@databaseName);
+
+OPEN spidCursor;
+
+FETCH NEXT FROM spidCursor INTO @spid;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @killCommand = @killCommand + 'KILL ' + CAST(@spid AS NVARCHAR(10)) + ';';
+    FETCH NEXT FROM spidCursor INTO @spid;
+END
+
+CLOSE spidCursor;
+DEALLOCATE spidCursor;
+
+-- Construct the restore command
+SET @restoreCommand = 'RESTORE DATABASE [' + @databaseName + '] FROM ';
+
+-- Add each backup file to the restore command
+DECLARE @backupFile NVARCHAR(500);
+DECLARE backupCursor CURSOR FOR
+SELECT BackupFile FROM @backupFiles;
+
+OPEN backupCursor;
+FETCH NEXT FROM backupCursor INTO @backupFile;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @restoreCommand = @restoreCommand + 'DISK = ''' + @backupFile + '''';
+    
+    FETCH NEXT FROM backupCursor INTO @backupFile;
+    
+    IF @@FETCH_STATUS = 0
+    BEGIN
+        SET @restoreCommand = @restoreCommand + ', ';
+    END
+END
+
+CLOSE backupCursor;
+DEALLOCATE backupCursor;
+
+-- Complete the restore command
+SET @restoreCommand = @restoreCommand + ' WITH REPLACE, RECOVERY';
+
+-- Execute the restore command
+EXEC sp_executesql @restoreCommand;
+
+-- Check if the restore was successful
+IF @@ERROR = 0
+BEGIN
+    SET @subject = 'Database Restore Completed Successfully';
+    SET @body = 'The database [' + @databaseName + '] has been restored successfully from the latest full backup.';
+    
+    -- Send success email
+    EXEC msdb.dbo.sp_send_dbmail
+        @profile_name = 'default',  -- replace with your Database Mail profile name
+        @recipients = 'henokteka87@yahoo.com', -- replace with the recipient's email address
+        @subject = @subject,
+        @body = @body;
+
+    PRINT 'Database restored successfully, and email notification sent.';
+END
+ELSE
+BEGIN
+    PRINT 'Database restore failed.';
+END
+SET NOCOUNT OFF
