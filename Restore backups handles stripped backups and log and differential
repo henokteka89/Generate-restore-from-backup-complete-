@@ -1,0 +1,191 @@
+/*
+    Script Purpose:
+    - This script restores a SQL Server database using full, differential, and log backups.
+    - Handles striped backups and ensures proper syntax for RESTORE commands.
+    - Automatically sets the database to SINGLE_USER mode to ensure exclusive access.
+    - Uses WITH REPLACE to overwrite the existing database, avoiding tail-log backup errors.
+    - Skips the RESTORE LOG command if no log backups are available.
+    - Outputs RESTORE commands for manual execution; it does not execute them.
+
+    Limitations:
+    - Assumes the backup files are available and accessible at the specified locations.
+    - Does not create the database if it doesn't exist; it only restores existing databases.
+    - Requires manual execution of printed RESTORE commands.
+*/
+
+
+
+DECLARE @databaseName sysname;
+DECLARE @backup_set_id_start INT;
+DECLARE @backup_set_id_end INT;
+DECLARE @maxdiffbackup_set_id INT;
+DECLARE @restoreCommand NVARCHAR(MAX);
+DECLARE @restoreFileList NVARCHAR(MAX) = '';
+DECLARE @dbExists BIT;
+DECLARE @logBackupExists BIT = 0;
+
+-- Set the database to be used
+SET @databaseName = 'admin';
+
+-- Check if the database exists
+IF EXISTS (SELECT 1 FROM sys.databases WHERE name = @databaseName)
+    SET @dbExists = 1;
+ELSE
+    SET @dbExists = 0;
+
+IF @dbExists = 0
+BEGIN
+    PRINT 'Database ' + @databaseName + ' does not exist on this server.';
+    RETURN;
+END
+
+-- Set the database to single-user mode to ensure exclusive access
+SET @restoreCommand = 'ALTER DATABASE ' + @databaseName + ' SET SINGLE_USER WITH ROLLBACK IMMEDIATE;';
+PRINT @restoreCommand;
+
+-- Get the latest full backup
+SELECT @backup_set_id_start = MAX(backup_set_id)
+FROM msdb.dbo.backupset
+WHERE database_name = @databaseName 
+  AND type = 'D'
+  AND is_copy_only = 0;
+
+-- Get the earliest full backup after the latest one
+SELECT @backup_set_id_end = MIN(backup_set_id)
+FROM msdb.dbo.backupset
+WHERE database_name = @databaseName 
+  AND type = 'D'
+  AND backup_set_id > @backup_set_id_start
+  AND is_copy_only = 0;
+
+IF @backup_set_id_end IS NULL 
+    SET @backup_set_id_end = 999999999;
+
+-- Get the latest differential backup
+SELECT @maxdiffbackup_set_id = MAX(backup_set_id)
+FROM msdb.dbo.backupset
+WHERE database_name = @databaseName 
+  AND type = 'I'
+  AND is_copy_only = 0
+  AND backup_set_id > @backup_set_id_start;
+
+-- Full Backup Restore Command
+DECLARE full_cursor CURSOR FOR
+SELECT mf.physical_device_name
+FROM msdb.dbo.backupset b
+JOIN msdb.dbo.backupmediafamily mf ON b.media_set_id = mf.media_set_id
+WHERE b.database_name = @databaseName 
+  AND b.backup_set_id = @backup_set_id_start
+  AND is_copy_only = 0;
+
+OPEN full_cursor;
+FETCH NEXT FROM full_cursor INTO @restoreFileList;
+
+SET @restoreCommand = 'RESTORE DATABASE ' + @databaseName + ' FROM ';
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    IF LEN(@restoreCommand) > 0
+        SET @restoreCommand = @restoreCommand + 'DISK = ''' + @restoreFileList + '''';
+    
+    FETCH NEXT FROM full_cursor INTO @restoreFileList;
+    
+    IF @@FETCH_STATUS = 0
+        SET @restoreCommand = @restoreCommand + ', ';
+END;
+
+CLOSE full_cursor;
+DEALLOCATE full_cursor;
+
+SET @restoreCommand = @restoreCommand + ' WITH NORECOVERY, REPLACE;';
+PRINT @restoreCommand;
+
+-- Differential Backup Restore Command
+IF @maxdiffbackup_set_id IS NOT NULL
+BEGIN
+    DECLARE diff_cursor CURSOR FOR
+    SELECT mf.physical_device_name
+    FROM msdb.dbo.backupset b
+    JOIN msdb.dbo.backupmediafamily mf ON b.media_set_id = mf.media_set_id
+    WHERE b.database_name = @databaseName 
+      AND b.backup_set_id = @maxdiffbackup_set_id
+      AND b.type = 'I'
+      AND is_copy_only = 0;
+
+    OPEN diff_cursor;
+    FETCH NEXT FROM diff_cursor INTO @restoreFileList;
+
+    SET @restoreCommand = 'RESTORE DATABASE ' + @databaseName + ' FROM ';
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        IF LEN(@restoreCommand) > 0
+            SET @restoreCommand = @restoreCommand + 'DISK = ''' + @restoreFileList + '''';
+        
+        FETCH NEXT FROM diff_cursor INTO @restoreFileList;
+        
+        IF @@FETCH_STATUS = 0
+            SET @restoreCommand = @restoreCommand + ', ';
+    END;
+
+    CLOSE diff_cursor;
+    DEALLOCATE diff_cursor;
+
+    SET @restoreCommand = @restoreCommand + ' WITH NORECOVERY;';
+    PRINT @restoreCommand;
+END;
+
+-- Log Backup Restore Commands
+DECLARE @backup_set_id INT;
+DECLARE log_cursor CURSOR FOR
+SELECT b.backup_set_id, mf.physical_device_name
+FROM msdb.dbo.backupset b
+JOIN msdb.dbo.backupmediafamily mf ON b.media_set_id = mf.media_set_id
+WHERE b.database_name = @databaseName 
+  AND b.backup_set_id >= @backup_set_id_start 
+  AND b.backup_set_id < @backup_set_id_end
+  AND b.backup_set_id > ISNULL(@maxdiffbackup_set_id, 0)
+  AND b.type = 'L'
+  AND is_copy_only = 0;
+
+OPEN log_cursor;
+FETCH NEXT FROM log_cursor INTO @backup_set_id, @restoreFileList;
+
+SET @restoreCommand = 'RESTORE LOG ' + @databaseName + ' FROM ';
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @logBackupExists = 1;
+    
+    IF LEN(@restoreCommand) > 0
+        SET @restoreCommand = @restoreCommand + 'DISK = ''' + @restoreFileList + '''';
+    
+    FETCH NEXT FROM log_cursor INTO @backup_set_id, @restoreFileList;
+    
+    IF @@FETCH_STATUS = 0
+        SET @restoreCommand = @restoreCommand + ', ';
+END;
+
+CLOSE log_cursor;
+DEALLOCATE log_cursor;
+
+IF @logBackupExists = 1
+BEGIN
+    SET @restoreCommand = @restoreCommand + ' WITH NORECOVERY;';
+    PRINT @restoreCommand;
+END;
+
+-- Final Restore with Recovery
+SET @restoreCommand = 'RESTORE DATABASE ' + @databaseName + ' WITH RECOVERY;';
+PRINT @restoreCommand;
+
+-- Set the database back to multi-user mode
+SET @restoreCommand = 'ALTER DATABASE ' + @databaseName + ' SET MULTI_USER;';
+PRINT @restoreCommand;
+/*
+-- Select Database File Information
+SELECT d.name, mf.name, mf.physical_name 
+FROM sys.master_files mf WITH(NOLOCK)
+JOIN sys.databases d ON d.database_id = mf.database_id
+WHERE d.name LIKE @databaseName;
+*/
