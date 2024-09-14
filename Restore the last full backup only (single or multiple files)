@@ -1,6 +1,6 @@
 /* 
    HENOK
-
+REMOVE THE KILL, IF NOT NECESSARY!
    Use Case Scenarios:
    - This script is designed to automate the restoration of a SQL Server database from the most recent full backup.
    - It supports both single backup files and striped backups (multiple backup files).
@@ -79,7 +79,9 @@ CLOSE spidCursor;
 DEALLOCATE spidCursor;
 
 -- Construct the restore command
-SET @restoreCommand = 'RESTORE DATABASE [' + @databaseName + '] FROM ';
+SET @restoreCommand = 'USE master;
+GO
+RESTORE DATABASE [' + @databaseName + '] FROM ';
 
 -- Add each backup file to the restore command
 DECLARE @backupFile NVARCHAR(500);
