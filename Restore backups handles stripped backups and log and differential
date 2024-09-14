@@ -40,7 +40,9 @@ BEGIN
 END
 
 -- Set the database to single-user mode to ensure exclusive access
-SET @restoreCommand = 'ALTER DATABASE ' + @databaseName + ' SET SINGLE_USER WITH ROLLBACK IMMEDIATE;';
+SET @restoreCommand = 'USE master;
+Go
+ALTER DATABASE ' + @databaseName + ' SET SINGLE_USER WITH ROLLBACK IMMEDIATE;';
 PRINT @restoreCommand;
 
 -- Get the latest full backup
