@@ -1,0 +1,215 @@
+USE [master];
+GO
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
+
+CREATE OR ALTER PROCEDURE dbo.sp_create_restorecommand
+    @databasename SYSNAME,                -- Database to restore
+    @restoretime   DATETIME = NULL,       -- Point in time (defaults = GETDATE)
+    @withrecovery  BIT = 1,               -- 1 = WITH RECOVERY at the end
+    @outputmode    NVARCHAR(10) = 'PRINT' -- 'PRINT' or 'TABLE'
+AS
+BEGIN
+    SET NOCOUNT ON;
+/*
+
+Purpose: 
+		Generates RESTORE DATABASE commands (Full, Diff, Logs) for point-in-time restore. 
+		Can output as PRINT statements (default) or as a table.
+
+Parameters: 
+		@databasename = Target database 
+		@restoretime = Point in time (NULL = now) 
+		@withrecovery = 1 = WITH RECOVERY at the end, 0 = leave restoring 
+		@outputmode = 'PRINT' (default) or 'TABLE' 
+
+Example: 
+		EXEC dbo.sp_create_restorecommand 
+				@databasename = 'admin', 
+				@restoretime = '2025-08-24 19:50:00', 
+				@withrecovery = 1,
+				@outputmode = 'Print'; --'TABLE'
+
+*/
+    BEGIN TRY
+        ----------------------------------------------------------------------
+        -- 0. Parameter Validation
+        ----------------------------------------------------------------------
+        IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name = @databasename)
+        BEGIN
+            RAISERROR('Database [%s] does not exist on this server.',16,1,@databasename);
+            RETURN;
+        END;
+
+        IF @outputmode NOT IN ('PRINT','TABLE')
+        BEGIN
+            RAISERROR('Invalid @outputmode. Use ''PRINT'' or ''TABLE''.',16,1);
+            RETURN;
+        END;
+
+        IF @restoretime IS NULL 
+            SET @restoretime = GETDATE();
+
+        DECLARE @backup_set_id_start     INT;
+        DECLARE @maxdiffbackup_set_id    INT;
+        DECLARE @restorecommand          NVARCHAR(MAX);
+        DECLARE @logrestorecommand       NVARCHAR(MAX);
+        DECLARE @backup_set_id           INT;
+
+        -- Table for output (used if @outputmode = 'TABLE')
+        DECLARE @RestoreCommands TABLE (
+            StepOrder   INT IDENTITY(1,1),
+            CommandType NVARCHAR(20),
+            CommandText NVARCHAR(MAX)
+        );
+
+        ----------------------------------------------------------------------
+        -- 1. Latest FULL backup
+        ----------------------------------------------------------------------
+        SELECT TOP 1 @backup_set_id_start = backup_set_id
+        FROM msdb.dbo.backupset
+        WHERE database_name     = @databasename
+          AND type              = 'D'
+          AND backup_finish_date <= @restoretime
+          AND is_copy_only       = 0
+        ORDER BY backup_finish_date DESC;
+
+        IF @backup_set_id_start IS NULL
+        BEGIN
+            RAISERROR('No FULL backup found before the specified restore time.',16,1);
+            RETURN;
+        END;
+
+        ----------------------------------------------------------------------
+        -- 2. Latest DIFF backup (if any)
+        ----------------------------------------------------------------------
+        SELECT TOP 1 @maxdiffbackup_set_id = backup_set_id
+        FROM msdb.dbo.backupset
+        WHERE database_name = @databasename
+          AND type          = 'I'
+          AND backup_finish_date <= @restoretime
+          AND backup_start_date >= (SELECT backup_start_date
+                                    FROM msdb.dbo.backupset
+                                    WHERE backup_set_id = @backup_set_id_start)
+          AND is_copy_only = 0
+        ORDER BY backup_finish_date DESC;
+
+        ----------------------------------------------------------------------
+        -- 3. FULL restore (WITH MOVE + tuning)
+        ----------------------------------------------------------------------
+        ;WITH FileMap AS (
+            SELECT mf.name AS logical_name,
+                   mf.physical_name
+            FROM sys.master_files mf
+            WHERE mf.database_id = DB_ID(@databasename)
+        )
+        SELECT @restorecommand =
+            '/* NOTE: Update file paths if restoring to another server */' + CHAR(13) +
+            'RESTORE DATABASE [' + @databasename + '] FROM ' +
+            CASE WHEN bmf.physical_device_name LIKE 'http%' 
+                 THEN 'URL = ''' ELSE 'DISK = ''' END +
+            bmf.physical_device_name + ''' ' +
+            'WITH NORECOVERY, ' +
+            STUFF((SELECT ', MOVE N''' + f.logical_name + ''' TO N''' + f.physical_name + ''''
+                   FROM FileMap f
+                   FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'),1,2,'') +
+            ', MAXTRANSFERSIZE = 4194304, BUFFERCOUNT = 400;'
+        FROM msdb.dbo.backupset b
+        JOIN msdb.dbo.backupmediafamily bmf ON b.media_set_id = bmf.media_set_id
+        WHERE b.backup_set_id = @backup_set_id_start;
+
+        IF @outputmode = 'TABLE'
+            INSERT INTO @RestoreCommands(CommandType, CommandText) VALUES('FULL', @restorecommand);
+        ELSE
+            PRINT @restorecommand;
+
+        ----------------------------------------------------------------------
+        -- 4. DIFF restore (if exists)
+        ----------------------------------------------------------------------
+        IF @maxdiffbackup_set_id IS NOT NULL
+        BEGIN
+            SELECT @restorecommand =
+                'RESTORE DATABASE [' + @databasename + '] FROM ' +
+                CASE WHEN bmf.physical_device_name LIKE 'http%' 
+                     THEN 'URL = ''' ELSE 'DISK = ''' END +
+                bmf.physical_device_name + ''' WITH NORECOVERY;'
+            FROM msdb.dbo.backupset b
+            JOIN msdb.dbo.backupmediafamily bmf ON b.media_set_id = bmf.media_set_id
+            WHERE b.backup_set_id = @maxdiffbackup_set_id;
+
+            IF @outputmode = 'TABLE'
+                INSERT INTO @RestoreCommands(CommandType, CommandText) VALUES('DIFF', @restorecommand);
+            ELSE
+                PRINT @restorecommand;
+        END;
+
+        ----------------------------------------------------------------------
+        -- 5. LOG restores (STOPAT for point-in-time if needed)
+        ----------------------------------------------------------------------
+        DECLARE log_cursor CURSOR FOR
+            SELECT b.backup_set_id,
+                'RESTORE LOG [' + @databasename + '] FROM ' +
+                CASE WHEN bmf.physical_device_name LIKE 'http%'
+                     THEN 'URL = ''' ELSE 'DISK = ''' END +
+                bmf.physical_device_name + ''' WITH ' +
+                CASE 
+                    WHEN b.backup_finish_date >= @restoretime 
+                         THEN 'STOPAT = ''' + CONVERT(VARCHAR, @restoretime, 120) + ''', ' +
+                              CASE WHEN @withrecovery = 1 THEN 'RECOVERY;' ELSE 'NORECOVERY;' END
+                    ELSE 'NORECOVERY;'
+                END
+            FROM msdb.dbo.backupset b
+            JOIN msdb.dbo.backupmediafamily bmf ON b.media_set_id = bmf.media_set_id
+            WHERE b.database_name = @databasename
+              AND b.type           = 'L'
+              AND b.backup_start_date >= (SELECT backup_finish_date
+                                          FROM msdb.dbo.backupset
+                                          WHERE backup_set_id = ISNULL(@maxdiffbackup_set_id, @backup_set_id_start))
+              AND b.backup_finish_date <= @restoretime
+              AND is_copy_only = 0
+            ORDER BY b.backup_start_date;
+
+        OPEN log_cursor;
+        FETCH NEXT FROM log_cursor INTO @backup_set_id, @logrestorecommand;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            IF @outputmode = 'TABLE'
+                INSERT INTO @RestoreCommands(CommandType, CommandText) VALUES('LOG', @logrestorecommand);
+            ELSE
+                PRINT @logrestorecommand;
+
+            FETCH NEXT FROM log_cursor INTO @backup_set_id, @logrestorecommand;
+        END;
+        CLOSE log_cursor;
+        DEALLOCATE log_cursor;
+
+        ----------------------------------------------------------------------
+        -- 6. Final WITH RECOVERY (only if requested)
+        ----------------------------------------------------------------------
+        IF @withrecovery = 1
+        BEGIN
+            SET @restorecommand = 'RESTORE DATABASE [' + @databasename + '] WITH RECOVERY;';
+            IF @outputmode = 'TABLE'
+                INSERT INTO @RestoreCommands(CommandType, CommandText) VALUES('RECOVERY', @restorecommand);
+            ELSE
+                PRINT @restorecommand;
+        END;
+
+        ----------------------------------------------------------------------
+        -- 7. Final Output (if TABLE mode)
+        ----------------------------------------------------------------------
+        IF @outputmode = 'TABLE'
+        BEGIN
+            SELECT StepOrder, CommandType, CommandText
+            FROM @RestoreCommands
+            ORDER BY StepOrder;
+        END;
+    END TRY
+    BEGIN CATCH
+        DECLARE @errmsg NVARCHAR(4000) = ERROR_MESSAGE();
+        RAISERROR('Error in sp_create_restorecommand: %s',16,1,@errmsg);
+    END CATCH
+END;
+GO
